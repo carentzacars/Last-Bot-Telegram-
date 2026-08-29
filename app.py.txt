@@ -851,6 +851,31 @@ app.job_queue.run_monthly(
     day=1
 )
 
+# ==========================================
+# KEEP-ALIVE WEB SERVER (ADD TO BOTTOM OF APP.PY)
+# ==========================================
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is alive!")
+
+    def log_message(self, format, *args):
+        return # Silences continuous terminal logs
+
+def run_health_server():
+    # Render assigns a port automatically using environment variables
+    port = int(os.environ.get("PORT", 8000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    print(f"Health server running on port {port}...")
+    server.serve_forever()
+
+# Launch the server in a separate background thread
+threading.Thread(target=run_health_server, daemon=True).start()
 
 print("Bot is running...")
 app.run_polling()
