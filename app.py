@@ -1,6 +1,6 @@
 import os
 import re
-import psycopg2  # Switched from sqlite3 to permanent cloud database
+import psycopg2
 from datetime import datetime, time
 
 from telegram import Update
@@ -14,15 +14,14 @@ from telegram.ext import (
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ACCOUNTS_GROUP_ID = int(os.environ["ACCOUNTS_GROUP_ID"])
-# Hardcoded IPv4 pooler connection string bypass
-DATABASE_URL = "postgresql://postgres.olggemwgtblmwvtwwivv:MSZwxf3055900@aws-0-ap-northeast-1.pooler.supabase.com:6543/postgres"  
+# Your stable cloud pooler network link remains locked right here
+DATABASE_URL = "postgresql://postgres.olggemwgtblmwvtwwivv:MSZwxf3055900@://supabase.com"  
 EXPENSES_GROUP_NAME = "cars expenses"
 
-# Connect to your permanent free cloud database
 conn = psycopg2.connect(DATABASE_URL, sslmode="require")
 cursor = conn.cursor()
 
-# PostgreSQL compatible table structures
+# Core relational database tables
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS group_totals (
     group_id TEXT PRIMARY KEY,
@@ -51,6 +50,17 @@ CREATE TABLE IF NOT EXISTS expense_group_config (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     group_id TEXT NOT NULL,
     group_name TEXT NOT NULL
+)
+""")
+
+# New Table to track message histories for message editing math
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS message_history (
+    message_id TEXT,
+    chat_id TEXT,
+    msg_type TEXT, -- 'price', 'refund', or 'expense'
+    amount INTEGER DEFAULT 0,
+    PRIMARY KEY (message_id, chat_id)
 )
 """)
 conn.commit()
@@ -88,17 +98,18 @@ def is_expenses_group(group_name):
 def is_configured_expenses_group(group_id, group_name):
     cursor.execute("SELECT group_id FROM expense_group_config WHERE id = 1")
     row = cursor.fetchone()
-    return (row is not None and row[0] == group_id) or is_expenses_group(group_name)
+    db_group_id = row[0] if row else None
+    return (db_group_id is not None and db_group_id == group_id) or is_expenses_group(group_name)
 
 def get_existing_total(group_id):
     cursor.execute("SELECT total FROM group_totals WHERE group_id = %s", (group_id,))
     row = cursor.fetchone()
-    return row[0] if row else 0
+    return int(row[0]) if row else 0
 
 def get_existing_expense(group_id):
     cursor.execute("SELECT total FROM group_expenses WHERE group_id = %s", (group_id,))
     row = cursor.fetchone()
-    return row[0] if row else 0
+    return int(row[0]) if row else 0
 
 def save_total(group_id, group_name, total):
     cursor.execute("""
@@ -106,7 +117,7 @@ def save_total(group_id, group_name, total):
     VALUES (%s, %s, %s)
     ON CONFLICT(group_id)
     DO UPDATE SET group_name = EXCLUDED.group_name, total = EXCLUDED.total
-    """, (group_id, group_name, total))
+    """, (group_id, group_name, int(total)))
     conn.commit()
 
 def save_expense(group_id, group_name, total):
@@ -115,11 +126,18 @@ def save_expense(group_id, group_name, total):
     VALUES (%s, %s, %s)
     ON CONFLICT(group_id)
     DO UPDATE SET group_name = EXCLUDED.group_name, total = EXCLUDED.total
-    """, (group_id, group_name, total))
+    """, (group_id, group_name, int(total)))
     conn.commit()
 
 def get_all_groups():
-    cursor.execute("SELECT group_id, group_name, total FROM group_totals WHERE group_id != %s", (str(ACCOUNTS_GROUP_ID),))
+    cursor.execute("SELECT group_id FROM expense_group_config WHERE id = 1")
+    row = cursor.fetchone()
+    config_exp_id = row[0] if row else "NONE"
+
+    cursor.execute("""
+        SELECT group_id, group_name, total FROM group_totals 
+        WHERE group_id != %s AND group_id != %s AND LOWER(group_name) != %s
+    """, (str(ACCOUNTS_GROUP_ID), str(config_exp_id), EXPENSES_GROUP_NAME.lower()))
     return cursor.fetchall()
 
 def get_all_expenses():
@@ -129,15 +147,31 @@ def get_all_expenses():
 def reset_all_totals():
     cursor.execute("UPDATE group_totals SET total = 0")
     cursor.execute("UPDATE group_expenses SET total = 0")
+    cursor.execute("DELETE FROM message_history")
     conn.commit()
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+def get_msg_history(message_id, chat_id):
+    cursor.execute("SELECT msg_type, amount FROM message_history WHERE message_id = %s AND chat_id = %s", (message_id, chat_id))
+    return cursor.fetchone()
+
+def save_msg_history(message_id, chat_id, msg_type, amount):
+    cursor.execute("""
+    INSERT INTO message_history (message_id, chat_id, msg_type, amount)
+    VALUES (%s, %s, %s, %s)
+    ON CONFLICT (message_id, chat_id)
+    DO UPDATE SET msg_type = EXCLUDED.msg_type, amount = EXCLUDED.amount
+    """, (message_id, chat_id, msg_type, int(amount)))
+    conn.commit()
+
+async def process_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE, is_edited=False):
+    msg = update.edited_message if is_edited else update.message
+    if not msg or not msg.text:
         return
 
-    message_text = update.message.text
+    message_text = msg.text
     source_group_id = str(update.effective_chat.id)
     source_group_name = update.effective_chat.title or "Unknown Group"
+    message_id = str(msg.message_id)
 
     if update.effective_chat.id == ACCOUNTS_GROUP_ID:
         return
@@ -146,21 +180,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     refund = extract_refund(message_text)
     expense = extract_expense(message_text) if is_configured_expenses_group(source_group_id, source_group_name) else None
 
-    if price is None and refund is None and expense is None:
-        return
+    # Get history if this is an edited message layout
+    history = get_msg_history(message_id, source_group_id) if is_edited else None
 
-    if price is None and refund is None and expense is not None:
+    # Scenario A: Processing expenses inside the Cars Expenses group chat
+    if is_configured_expenses_group(source_group_id, source_group_name):
+        current_amount = expense if expense is not None else 0
+        old_amount = history[1] if (history and history[0] == 'expense') else 0
+        
+        if current_amount == 0 and old_amount == 0 and price is None and refund is None:
+            return
+
+        diff = current_amount - old_amount
         existing_expense = get_existing_expense(source_group_id)
-        new_expense = existing_expense + expense
+        new_expense = existing_expense + diff
         save_expense(source_group_id, source_group_name, new_expense)
+        save_msg_history(message_id, source_group_id, 'expense', current_amount)
 
         all_groups = get_all_groups()
         all_expenses = get_all_expenses()
         grand_total = sum(total for _, _, total in all_groups)
         expense_total = sum(total for _, _, total in all_expenses)
 
+        tag = " [EDITED]" if is_edited else ""
         lines = [
-            f"{source_group_name} expense: {existing_expense} + {expense} = {new_expense}",
+            f"{source_group_name} expense{tag}: {existing_expense} + ({diff}) = {new_expense}",
             "",
             "All Groups:",
         ]
@@ -179,14 +223,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=ACCOUNTS_GROUP_ID, text="\n".join(lines))
         return
 
+    # Scenario B: Processing regular vehicle income (Prices & Refunds)
+    if price is None and refund is None:
+        return
+
+    # Math computation layout tracking differences
+    old_type = history[0] if history else None
+    old_amount = history[1] if history else 0
+
     existing_total = get_existing_total(source_group_id)
+    base_total = existing_total
+    
+    if old_type == 'price':
+        base_total -= old_amount
+    elif old_type == 'refund':
+        base_total += old_amount
 
     if price is not None:
-        new_total = existing_total + price
-        update_line = f"{source_group_name} : {existing_total} + {price} = {new_total}"
+        new_total = base_total + price
+        diff = new_total - existing_total
+        save_msg_history(message_id, source_group_id, 'price', price)
+        tag = " [EDITED]" if is_edited else ""
+        update_line = f"{source_group_name}{tag} : {existing_total} + ({diff}) = {new_total}"
     else:
-        new_total = existing_total - refund
-        update_line = f"{source_group_name} : {existing_total} - {refund} = {new_total} (refund)"
+        new_total = base_total - refund
+        diff = new_total - existing_total
+        save_msg_history(message_id, source_group_id, 'refund', refund)
+        tag = " [EDITED]" if is_edited else ""
+        update_line = f"{source_group_name}{tag} : {existing_total} + ({diff}) = {new_total} (refund change)"
 
     save_total(source_group_id, source_group_name, new_total)
 
@@ -207,6 +271,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_message(chat_id=ACCOUNTS_GROUP_ID, text="\n".join(lines))
 
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await process_any_message(update, context, is_edited=False)
+
+async def handle_edited_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await process_any_message(update, context, is_edited=True)
+
 async def total_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
 
@@ -215,7 +285,7 @@ async def total_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         all_expenses = get_all_expenses()
 
         if not all_groups and not all_expenses:
-            await update.message.reply_text("No group totals recorded yet.")
+            await update.message.reply_text("No group records registered yet.")
             return
 
         grand_total = sum(total for _, _, total in all_groups)
@@ -362,7 +432,6 @@ async def resetall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 async def monthly_reset(context: ContextTypes.DEFAULT_TYPE):
-    # FIX: Block double execution immediately
     if has_reset_this_month():
         return
 
@@ -385,12 +454,10 @@ async def monthly_reset(context: ContextTypes.DEFAULT_TYPE):
     reset_all_totals()
 
     await context.bot.send_message(chat_id=ACCOUNTS_GROUP_ID, text="\n".join(lines))
-    print(f"Monthly reset done for {month_label}")
 
 async def startup_check(context: ContextTypes.DEFAULT_TYPE):
-    # FIX: If it's a completely clean database structure, log month instead of resetting
     cursor.execute("SELECT COUNT(*) FROM group_totals")
-    has_data = cursor.fetchone()[0] > 0
+    has_data = cursor.fetchone() > 0
     
     if not has_reset_this_month():
         if not has_data:
@@ -406,12 +473,15 @@ app.add_handler(CommandHandler("reset", reset_command))
 app.add_handler(CommandHandler("setexpenses", setexpenses_command))
 app.add_handler(CommandHandler("resetall", resetall_command))
 app.add_handler(CommandHandler("remove", remove_command))
+
+# Handlers for both new messages and edited corrections
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & filters.TEXT, handle_edited_message))
 
 app.job_queue.run_once(startup_check, when=5)
 app.job_queue.run_monthly(monthly_reset, when=time(0, 0, 0), day=1)
 
-# KEEP-ALIVE WEB SERVER FOR RENDER
+# KEEP-ALIVE SERVER CONFIGURATION
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -431,5 +501,7 @@ def run_health_server():
 
 threading.Thread(target=run_health_server, daemon=True).start()
 
-print("Bot is running...")
+print("Carentza Cars Bot is running...")
 app.run_polling()
+
+
