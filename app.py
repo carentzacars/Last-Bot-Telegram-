@@ -457,7 +457,9 @@ async def monthly_reset(context: ContextTypes.DEFAULT_TYPE):
 
 async def startup_check(context: ContextTypes.DEFAULT_TYPE):
     cursor.execute("SELECT COUNT(*) FROM group_totals")
-    has_data = cursor.fetchone() > 0
+    row = cursor.fetchone()
+    # Fix: Extract the raw number from the database tuple safely
+    has_data = row[0] > 0 if row else False
     
     if not has_reset_this_month():
         if not has_data:
