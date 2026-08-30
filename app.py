@@ -14,7 +14,8 @@ from telegram.ext import (
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ACCOUNTS_GROUP_ID = int(os.environ["ACCOUNTS_GROUP_ID"])
-DATABASE_URL = "postgresql://postgres.olggemwgtblmwvtwwivv:MSZwxf3055900@://supabase.com"  # Hardcoded IPv4 pooler connection string bypass
+# Hardcoded IPv4 pooler connection string bypass
+DATABASE_URL = "postgresql://postgres.olggemwgtblmwvtwwivv:MSZwxf3055900@aws-0-ap-northeast-1.pooler.supabase.com:6543/postgres"  
 EXPENSES_GROUP_NAME = "cars expenses"
 
 # Connect to your permanent free cloud database
