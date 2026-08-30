@@ -501,5 +501,5 @@ def run_health_server():
 
 threading.Thread(target=run_health_server, daemon=True).start()
 
-print("Bot is running...")
+print("Carentza Cars Bot is running...")
 app.run_polling()
