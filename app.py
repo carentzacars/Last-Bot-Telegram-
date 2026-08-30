@@ -15,7 +15,7 @@ from telegram.ext import (
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ACCOUNTS_GROUP_ID = int(os.environ["ACCOUNTS_GROUP_ID"])
 # Your stable cloud pooler network link remains locked right here
-DATABASE_URL = "postgresql://postgres.olggemwgtblmwvtwwivv:MSZwxf3055900@://supabase.com"  
+DATABASE_URL = "postgresql://postgres.olggemwgtblmwvtwwivv:MSZwxf3055900@aws-0-ap-northeast-1.pooler.supabase.com:6543/postgres"  
 EXPENSES_GROUP_NAME = "cars expenses"
 
 conn = psycopg2.connect(DATABASE_URL, sslmode="require")
@@ -98,18 +98,18 @@ def is_expenses_group(group_name):
 def is_configured_expenses_group(group_id, group_name):
     cursor.execute("SELECT group_id FROM expense_group_config WHERE id = 1")
     row = cursor.fetchone()
-    db_group_id = row[0] if row else None
+    db_group_id = row if row else None
     return (db_group_id is not None and db_group_id == group_id) or is_expenses_group(group_name)
 
 def get_existing_total(group_id):
     cursor.execute("SELECT total FROM group_totals WHERE group_id = %s", (group_id,))
     row = cursor.fetchone()
-    return int(row[0]) if row else 0
+    return int(row) if row else 0
 
 def get_existing_expense(group_id):
     cursor.execute("SELECT total FROM group_expenses WHERE group_id = %s", (group_id,))
     row = cursor.fetchone()
-    return int(row[0]) if row else 0
+    return int(row) if row else 0
 
 def save_total(group_id, group_name, total):
     cursor.execute("""
@@ -132,7 +132,7 @@ def save_expense(group_id, group_name, total):
 def get_all_groups():
     cursor.execute("SELECT group_id FROM expense_group_config WHERE id = 1")
     row = cursor.fetchone()
-    config_exp_id = row[0] if row else "NONE"
+    config_exp_id = row if row else "NONE"
 
     cursor.execute("""
         SELECT group_id, group_name, total FROM group_totals 
@@ -501,7 +501,5 @@ def run_health_server():
 
 threading.Thread(target=run_health_server, daemon=True).start()
 
-print("Carentza Cars Bot is running...")
+print("Bot is running...")
 app.run_polling()
-
-
