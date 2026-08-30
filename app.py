@@ -984,7 +984,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Carentza Cars Bot is alive!")
+        self.wfile.write(b"Carentza Bot is alive!")
 
     def log_message(self, format, *args):
         return
@@ -1009,15 +1009,24 @@ app.add_handler(CommandHandler("setexpenses", setexpenses_command))
 app.add_handler(CommandHandler("resetall", resetall_command))
 app.add_handler(CommandHandler("remove", remove_command))
 
-# Normal messages.
-app.add_handler(
-    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
-)
-
-# Edited messages.
+# Normal messages ONLY.
+# filters.TEXT by itself also matches edited messages, so the update type
+# must be explicitly restricted to MESSAGE.
 app.add_handler(
     MessageHandler(
-        filters.UpdateType.EDITED_MESSAGE & filters.TEXT,
+        filters.TEXT
+        & ~filters.COMMAND
+        & filters.UpdateType.MESSAGE,
+        handle_message,
+    )
+)
+
+# Edited messages ONLY.
+# This ensures an edited message cannot be consumed by the normal handler.
+app.add_handler(
+    MessageHandler(
+        filters.TEXT
+        & filters.UpdateType.EDITED_MESSAGE,
         handle_edited_message,
     )
 )
@@ -1037,5 +1046,5 @@ threading.Thread(
     daemon=True,
 ).start()
 
-print("Carentza Cars Bot is running...")
+print("Carentza Bot is running...")
 app.run_polling()
