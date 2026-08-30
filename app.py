@@ -899,6 +899,109 @@ async def resetall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
+# /RECALCULATE
+# ============================================================
+
+def calculate_month(month):
+    income_rows = db_execute(
+        """
+        SELECT group_id, MAX(group_name) AS group_name,
+               COALESCE(SUM(amount), 0) AS total
+        FROM transactions
+        WHERE month_key = %s
+          AND is_active = TRUE
+          AND transaction_type IN ('income', 'refund')
+          AND group_id != %s
+          AND NOT EXISTS (
+              SELECT 1
+              FROM expense_group_config egc
+              WHERE egc.id = 1
+                AND egc.group_id = transactions.group_id
+          )
+          AND LOWER(group_name) != LOWER(%s)
+        GROUP BY group_id
+        ORDER BY group_name
+        """,
+        (month, str(ACCOUNTS_GROUP_ID), EXPENSES_GROUP_NAME),
+        fetchall=True,
+    )
+
+    expense_rows = db_execute(
+        """
+        SELECT group_id, MAX(group_name) AS group_name,
+               COALESCE(SUM(amount), 0) AS total
+        FROM transactions
+        WHERE month_key = %s
+          AND is_active = TRUE
+          AND transaction_type = 'expense'
+          AND group_id != %s
+        GROUP BY group_id
+        ORDER BY group_name
+        """,
+        (month, str(ACCOUNTS_GROUP_ID)),
+        fetchall=True,
+    )
+
+    total_income = sum(int(row["total"]) for row in income_rows)
+    total_expenses = sum(int(row["total"]) for row in expense_rows)
+
+    return income_rows, expense_rows, total_income, total_expenses
+
+
+async def recalculate_command(update, context):
+    if not update.effective_chat or not update.message:
+        return
+
+    if update.effective_chat.id != ACCOUNTS_GROUP_ID:
+        await update.message.reply_text(
+            "This command can only be used in the Accounts group."
+        )
+        return
+
+    if not await is_admin(update, context):
+        await update.message.reply_text(
+            "Only group admins can recalculate totals."
+        )
+        return
+
+    requested_month = month_key()
+
+    if context.args:
+        value = context.args[0].strip()
+
+        if not re.fullmatch(r"\d{4}-\d{2}", value):
+            await update.message.reply_text(
+                "Use /recalculate or /recalculate YYYY-MM\n"
+                "Example: /recalculate 2026-08"
+            )
+            return
+
+        requested_month = value
+
+    income_rows, expense_rows, total_income, total_expenses = calculate_month(
+        requested_month
+    )
+
+    lines = [
+        f"Recalculated: {requested_month}",
+        "",
+        "Cars Income:",
+    ]
+
+    for row in income_rows:
+        lines.append(f'{row["group_name"]} : {int(row["total"])}')
+
+    lines.extend([
+        "",
+        f"Total Income: {total_income}",
+        f"Total Expenses: {total_expenses}",
+        f"Net Total : {total_income - total_expenses}",
+    ])
+
+    await update.message.reply_text("\n".join(lines))
+
+
+# ============================================================
 # MONTHLY RESET
 # ============================================================
 
@@ -984,7 +1087,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Carentza Bot is alive!")
+        self.wfile.write(b"Carentza Cars Bot is alive!")
 
     def log_message(self, format, *args):
         return
@@ -1008,6 +1111,7 @@ app.add_handler(CommandHandler("reset", reset_command))
 app.add_handler(CommandHandler("setexpenses", setexpenses_command))
 app.add_handler(CommandHandler("resetall", resetall_command))
 app.add_handler(CommandHandler("remove", remove_command))
+app.add_handler(CommandHandler("recalculate", recalculate_command))
 
 # Normal messages ONLY.
 # filters.TEXT by itself also matches edited messages, so the update type
@@ -1046,5 +1150,5 @@ threading.Thread(
     daemon=True,
 ).start()
 
-print("Carentza Bot is running...")
+print("Carentza Cars Bot is running...")
 app.run_polling()
