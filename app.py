@@ -14,7 +14,6 @@ from telegram.ext import (
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ACCOUNTS_GROUP_ID = int(os.environ["ACCOUNTS_GROUP_ID"])
-# Your stable cloud pooler network link remains locked right here
 DATABASE_URL = "postgresql://postgres.olggemwgtblmwvtwwivv:MSZwxf3055900@aws-0-ap-northeast-1.pooler.supabase.com:6543/postgres"  
 EXPENSES_GROUP_NAME = "cars expenses"
 
@@ -53,7 +52,7 @@ CREATE TABLE IF NOT EXISTS expense_group_config (
 )
 """)
 
-# New Table to track message histories for message editing math
+# Table to track message histories for message editing math
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS message_history (
     message_id TEXT,
@@ -87,7 +86,11 @@ def extract_expense(message_text):
     if re.search(r"(?i)\badvance(?:d)?\b", message_text):
         return None
     matches = re.finditer(r"(?i)(?:\brm\s*(\d+)\b|(\d+)\s*rm\b|\bamount\s*:\s*(?:rm\s*)?(\d+)\b)", message_text)
-    amounts = [int(match.group(1) or match.group(2) or match.group(3)) for match in matches]
+    amounts = []
+    for match in matches:
+        val = match.group(1) or match.group(2) or match.group(3)
+        if val:
+            amounts.append(int(val))
     return sum(amounts) if amounts else None
 
 def is_expenses_group(group_name):
@@ -98,18 +101,18 @@ def is_expenses_group(group_name):
 def is_configured_expenses_group(group_id, group_name):
     cursor.execute("SELECT group_id FROM expense_group_config WHERE id = 1")
     row = cursor.fetchone()
-    db_group_id = row if row else None
+    db_group_id = row[0] if row else None
     return (db_group_id is not None and db_group_id == group_id) or is_expenses_group(group_name)
 
 def get_existing_total(group_id):
     cursor.execute("SELECT total FROM group_totals WHERE group_id = %s", (group_id,))
     row = cursor.fetchone()
-    return int(row) if row else 0
+    return int(row[0]) if row else 0
 
 def get_existing_expense(group_id):
     cursor.execute("SELECT total FROM group_expenses WHERE group_id = %s", (group_id,))
     row = cursor.fetchone()
-    return int(row) if row else 0
+    return int(row[0]) if row else 0
 
 def save_total(group_id, group_name, total):
     cursor.execute("""
@@ -132,7 +135,7 @@ def save_expense(group_id, group_name, total):
 def get_all_groups():
     cursor.execute("SELECT group_id FROM expense_group_config WHERE id = 1")
     row = cursor.fetchone()
-    config_exp_id = row if row else "NONE"
+    config_exp_id = row[0] if row else "NONE"
 
     cursor.execute("""
         SELECT group_id, group_name, total FROM group_totals 
@@ -152,7 +155,8 @@ def reset_all_totals():
 
 def get_msg_history(message_id, chat_id):
     cursor.execute("SELECT msg_type, amount FROM message_history WHERE message_id = %s AND chat_id = %s", (message_id, chat_id))
-    return cursor.fetchone()
+    row = cursor.fetchone()
+    return (row[0], int(row[1])) if row else (None, 0)
 
 def save_msg_history(message_id, chat_id, msg_type, amount):
     cursor.execute("""
@@ -180,16 +184,16 @@ async def process_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     refund = extract_refund(message_text)
     expense = extract_expense(message_text) if is_configured_expenses_group(source_group_id, source_group_name) else None
 
-    # Get history if this is an edited message layout
-    history = get_msg_history(message_id, source_group_id) if is_edited else None
+    if price is None and refund is None and expense is None:
+        return
 
-    # Scenario A: Processing expenses inside the Cars Expenses group chat
+    old_type, old_amount = get_msg_history(message_id, source_group_id)
+
+    # 1. SCENARIO A: Cars Expenses Group (Strictly fleet expenses)
     if is_configured_expenses_group(source_group_id, source_group_name):
-        current_amount = expense if expense is not None else 0
-        old_amount = history[1] if (history and history[0] == 'expense') else 0
-        
-        if current_amount == 0 and old_amount == 0 and price is None and refund is None:
+        if expense is None:
             return
+        current_amount = expense
 
         diff = current_amount - old_amount
         existing_expense = get_existing_expense(source_group_id)
@@ -223,13 +227,9 @@ async def process_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await context.bot.send_message(chat_id=ACCOUNTS_GROUP_ID, text="\n".join(lines))
         return
 
-    # Scenario B: Processing regular vehicle income (Prices & Refunds)
+    # 2. SCENARIO B: Individual Vehicle Groups (Income only)
     if price is None and refund is None:
         return
-
-    # Math computation layout tracking differences
-    old_type = history[0] if history else None
-    old_amount = history[1] if history else 0
 
     existing_total = get_existing_total(source_group_id)
     base_total = existing_total
@@ -265,7 +265,7 @@ async def process_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     lines.extend([
         f"\nTotal : {grand_total}",
-        f"Expenses Total : {expense_total}",
+        f"\nExpenses Total : {expense_total}",
         f"Net Total : {grand_total - expense_total}",
     ])
 
@@ -458,7 +458,7 @@ async def monthly_reset(context: ContextTypes.DEFAULT_TYPE):
 async def startup_check(context: ContextTypes.DEFAULT_TYPE):
     cursor.execute("SELECT COUNT(*) FROM group_totals")
     row = cursor.fetchone()
-    # Fix: Extract the raw number from the database tuple safely
+    # Corrected tuple index checking
     has_data = row[0] > 0 if row else False
     
     if not has_reset_this_month():
@@ -476,7 +476,6 @@ app.add_handler(CommandHandler("setexpenses", setexpenses_command))
 app.add_handler(CommandHandler("resetall", resetall_command))
 app.add_handler(CommandHandler("remove", remove_command))
 
-# Handlers for both new messages and edited corrections
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & filters.TEXT, handle_edited_message))
 
@@ -492,7 +491,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Bot is alive!")
+        self.wfile.write(b"Carentza Bot is alive!")
     def log_message(self, format, *args):
         return
 
@@ -503,5 +502,5 @@ def run_health_server():
 
 threading.Thread(target=run_health_server, daemon=True).start()
 
-print("Carentza Cars Bot is running...")
+print("Carentza Bot is running...")
 app.run_polling()
