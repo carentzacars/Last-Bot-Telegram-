@@ -110,6 +110,20 @@ def init_database():
             )
         """)
 
+        # IMPORTANT: older deployments may already have the transactions table
+        # with the original CHECK constraint (income/refund/expense only).
+        # Replacing the constraint here makes the legacy opening-balance
+        # migration safe on an existing Supabase database as well as a fresh one.
+        cur.execute("""
+            ALTER TABLE transactions
+            DROP CONSTRAINT IF EXISTS transactions_transaction_type_check
+        """)
+        cur.execute("""
+            ALTER TABLE transactions
+            ADD CONSTRAINT transactions_transaction_type_check
+            CHECK (transaction_type IN ('income', 'refund', 'expense', 'opening'))
+        """)
+
         cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_transactions_month
             ON transactions (month_key, is_active, group_id)
