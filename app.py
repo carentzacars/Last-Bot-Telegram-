@@ -37,7 +37,6 @@ conn.autocommit = False
 
 
 def db_execute(sql, params=(), fetchone=False, fetchall=False):
-    global conn
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql, params)
@@ -56,7 +55,7 @@ def db_execute(sql, params=(), fetchone=False, fetchall=False):
 
 def init_database():
     with conn.cursor() as cur:
-        # Legacy tables are kept so an existing deployment does not break.
+        # Existing tables are deliberately preserved.
         cur.execute("""
             CREATE TABLE IF NOT EXISTS group_totals (
                 group_id TEXT PRIMARY KEY,
@@ -75,9 +74,8 @@ def init_database():
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS reset_log (
-                id BIGSERIAL PRIMARY KEY,
-                reset_month TEXT NOT NULL UNIQUE,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                id SERIAL PRIMARY KEY,
+                reset_month TEXT
             )
         """)
 
@@ -89,49 +87,33 @@ def init_database():
             )
         """)
 
-        # One row per Telegram accounting message.
-        # This is what makes edits, refunds, recalculation and duplicate
-        # protection reliable.
+        # Additive ledger used for edits, duplicate protection, /remove,
+        # and future-month /recalculate. It does NOT import old balances.
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS transactions (
+            CREATE TABLE IF NOT EXISTS transaction_ledger (
                 id BIGSERIAL PRIMARY KEY,
                 group_id TEXT NOT NULL,
                 group_name TEXT NOT NULL,
                 telegram_message_id BIGINT NOT NULL,
                 transaction_type TEXT NOT NULL
-                    CHECK (transaction_type IN ('income', 'refund', 'expense', 'opening')),
+                    CHECK (transaction_type IN ('income', 'refund', 'expense')),
                 amount INTEGER NOT NULL,
                 description TEXT,
                 month_key TEXT NOT NULL,
                 is_active BOOLEAN NOT NULL DEFAULT TRUE,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                UNIQUE (group_id, telegram_message_id)
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
 
-        # IMPORTANT: older deployments may already have the transactions table
-        # with the original CHECK constraint (income/refund/expense only).
-        # Replacing the constraint here makes the legacy opening-balance
-        # migration safe on an existing Supabase database as well as a fresh one.
         cur.execute("""
-            ALTER TABLE transactions
-            DROP CONSTRAINT IF EXISTS transactions_transaction_type_check
-        """)
-        cur.execute("""
-            ALTER TABLE transactions
-            ADD CONSTRAINT transactions_transaction_type_check
-            CHECK (transaction_type IN ('income', 'refund', 'expense', 'opening'))
+            CREATE INDEX IF NOT EXISTS idx_transaction_ledger_message
+            ON transaction_ledger (group_id, telegram_message_id)
         """)
 
         cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_transactions_month
-            ON transactions (month_key, is_active, group_id)
-        """)
-
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_transactions_message
-            ON transactions (group_id, telegram_message_id)
+            CREATE INDEX IF NOT EXISTS idx_transaction_ledger_month
+            ON transaction_ledger (month_key, is_active, transaction_type)
         """)
 
     conn.commit()
@@ -152,12 +134,18 @@ def current_month_label():
     return datetime.now(KL_TZ).strftime("%B %Y")
 
 
+def month_is_valid(value):
+    return bool(re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", value))
+
+
 def normalize_group_name(name):
     return re.sub(r"[^a-z0-9]", "", name.casefold())
 
 
 def is_expenses_group(group_name):
-    return normalize_group_name(group_name) == normalize_group_name(EXPENSES_GROUP_NAME)
+    return normalize_group_name(group_name) == normalize_group_name(
+        EXPENSES_GROUP_NAME
+    )
 
 
 def is_configured_expenses_group(group_id, group_name):
@@ -166,7 +154,10 @@ def is_configured_expenses_group(group_id, group_name):
         fetchone=True,
     )
     configured_id = row["group_id"] if row else None
-    return (configured_id is not None and configured_id == group_id) or is_expenses_group(group_name)
+    return (
+        configured_id is not None and configured_id == group_id
+    ) or is_expenses_group(group_name)
+
 
 # ============================================================
 # MESSAGE PARSING
@@ -175,275 +166,318 @@ def is_configured_expenses_group(group_id, group_name):
 
 def extract_price(message_text):
     match = re.search(
-        r"(?im)^\s*price\s*:\s*(?:rm\s*)?(\d+)\s*(?:rm|cash|online)?\s*$",
+        r"(?im)^\s*price\s*:\s*(?:rm\s*)?(\d+(?:\.\d+)?)"
+        r"\s*(?:rm|cash|online)?\s*$",
         message_text,
     )
-    return int(match.group(1)) if match else None
+    return int(float(match.group(1))) if match else None
 
 
 def extract_refund(message_text):
     match = re.search(
-        r"(?im)^\s*refund\s*:\s*(?:rm\s*)?(\d+)\s*(?:rm|cash|online)?\s*$",
+        r"(?im)^\s*refund\s*:\s*(?:rm\s*)?(\d+(?:\.\d+)?)"
+        r"\s*(?:rm|cash|online)?\s*$",
         message_text,
     )
-    return int(match.group(1)) if match else None
-
-
-def extract_structured_expense(message_text):
-    """Read the explicit Amount field used by structured expenses."""
-    match = re.search(
-        r"(?im)^\s*amount\s*:\s*(?:rm\s*)?(\d+(?:\.\d+)?)\s*(?:rm|cash|online)?\s*$",
-        message_text,
-    )
-    if not match:
-        return None
-    return int(float(match.group(1)))
+    return int(float(match.group(1))) if match else None
 
 
 def extract_expense(message_text):
-    """
-    Expense amounts must be explicitly marked with RM / rm or an Amount field.
-
-    This deliberately does NOT treat bare numbers as money. Therefore:
-        Car wash myvi black
-        6964
-        Rm 10
-    records RM10, not RM6964.
-    """
+    # "advance" messages are not expenses.
     if re.search(r"(?i)\badvance(?:d)?\b", message_text):
         return None
 
-    structured = extract_structured_expense(message_text)
-    if structured is not None:
-        return structured
-
-    # If there is an Amount field but it did not parse, do not fall back to
-    # unrelated numbers elsewhere in the message.
-    if re.search(r"(?im)^\s*amount\s*:", message_text):
-        return None
-
-    matches = re.finditer(
-        r"(?i)(?:\brm\s*(\d+(?:\.\d+)?)\b|(\d+(?:\.\d+)?)\s*rm\b)",
+    # Preferred structured format:
+    # Amount: 50
+    match = re.search(
+        r"(?im)^\s*amount\s*:\s*(?:rm\s*)?"
+        r"(\d+(?:\.\d+)?)\s*(?:rm|cash|online)?\s*$",
         message_text,
     )
+    if match:
+        return int(float(match.group(1)))
 
+    # Legacy/free-form format:
+    # Only explicitly marked RM values count.
+    # A bare line such as "6964" is deliberately ignored because it can
+    # be a vehicle number.
     amounts = []
-    for match in matches:
-        value = match.group(1) or match.group(2)
-        if value:
-            amounts.append(int(float(value)))
+
+    for line in message_text.splitlines():
+        line = line.strip()
+
+        if not line or re.fullmatch(r"\d+(?:\.\d+)?", line):
+            continue
+
+        for match in re.finditer(
+            r"(?i)(?:\brm\s*(\d+(?:\.\d+)?)\b|"
+            r"(\d+(?:\.\d+)?)\s*rm\b)",
+            line,
+        ):
+            value = match.group(1) or match.group(2)
+            if value:
+                amounts.append(int(float(value)))
 
     return sum(amounts) if amounts else None
 
 
-def extract_structured_expense_details(message_text):
-    def field(name):
-        pattern = rf"(?im)^\s*{re.escape(name)}\s*:\s*(.*?)\s*$"
-        match = re.search(pattern, message_text)
-        return match.group(1).strip() if match else ""
-
-    car_name = field("Car name") or "GENERAL"
-    paid_to = field("Paid to")
-    details = field("Details")
-
-    if paid_to and details:
-        description = f"{car_name} — {details} (Paid to: {paid_to})"
-    elif details:
-        description = f"{car_name} — {details}"
-    elif paid_to:
-        description = f"{car_name} — Paid to: {paid_to}"
-    else:
-        description = car_name
-
-    return description
-
-
 def extract_expense_name(message_text):
-    if re.search(r"(?im)^\s*car\s+name\s*:", message_text):
-        return extract_structured_expense_details(message_text)
+    # Structured expense details.
+    car = re.search(
+        r"(?im)^\s*car\s*name\s*:\s*(.+?)\s*$",
+        message_text,
+    )
+    amount = re.search(
+        r"(?im)^\s*amount\s*:\s*(?:rm\s*)?"
+        r"\d+(?:\.\d+)?\s*(?:rm|cash|online)?\s*$",
+        message_text,
+    )
+    paid = re.search(
+        r"(?im)^\s*paid\s*to\s*:\s*(.+?)\s*$",
+        message_text,
+    )
+    details = re.search(
+        r"(?im)^\s*details\s*:\s*(.+?)\s*$",
+        message_text,
+    )
 
+    if car or paid or details:
+        parts = []
+        if car:
+            parts.append(car.group(1).strip())
+        if details:
+            parts.append(details.group(1).strip())
+        if paid:
+            parts.append(f"Paid to {paid.group(1).strip()}")
+        return " - ".join(parts) if parts else "Expense"
+
+    # Free-form expense name: first line, with money removed.
     lines = [line.strip() for line in message_text.splitlines() if line.strip()]
     if not lines:
         return "Expense"
 
     name = lines[0]
-    name = re.sub(r"(?i)\brm\s*\d+(?:\.\d+)?\b|\b\d+(?:\.\d+)?\s*rm\b", "", name)
-    name = re.sub(r"(?i)\bamount\s*:\s*(?:rm\s*)?\d+(?:\.\d+)?\b", "", name)
+    name = re.sub(
+        r"(?i)\brm\s*\d+(?:\.\d+)?\b|"
+        r"\b\d+(?:\.\d+)?\s*rm\b",
+        "",
+        name,
+    )
     name = re.sub(r"(?i)\b(?:cash|online)\b", "", name)
     name = re.sub(r"\s+", " ", name).strip(" :-–—")
     return name if name else "Expense"
 
+
 # ============================================================
-# TRANSACTION HELPERS
+# EXISTING TOTAL TABLE HELPERS
 # ============================================================
 
 
-def get_transaction(group_id, message_id):
+def get_existing_total(group_id):
+    row = db_execute(
+        "SELECT total FROM group_totals WHERE group_id = %s",
+        (group_id,),
+        fetchone=True,
+    )
+    return int(row["total"]) if row else 0
+
+
+def get_existing_expense(group_id):
+    row = db_execute(
+        "SELECT total FROM group_expenses WHERE group_id = %s",
+        (group_id,),
+        fetchone=True,
+    )
+    return int(row["total"]) if row else 0
+
+
+def save_total(group_id, group_name, total):
+    db_execute(
+        """
+        INSERT INTO group_totals (group_id, group_name, total)
+        VALUES (%s, %s, %s)
+        ON CONFLICT(group_id)
+        DO UPDATE SET
+            group_name = EXCLUDED.group_name,
+            total = EXCLUDED.total
+        """,
+        (group_id, group_name, int(total)),
+    )
+
+
+def save_expense(group_id, group_name, total):
+    db_execute(
+        """
+        INSERT INTO group_expenses (group_id, group_name, total)
+        VALUES (%s, %s, %s)
+        ON CONFLICT(group_id)
+        DO UPDATE SET
+            group_name = EXCLUDED.group_name,
+            total = EXCLUDED.total
+        """,
+        (group_id, group_name, int(total)),
+    )
+
+
+def get_all_groups():
     return db_execute(
         """
-        SELECT * FROM transactions
-        WHERE group_id = %s AND telegram_message_id = %s
+        SELECT group_id, group_name, total
+        FROM group_totals
+        WHERE group_id != %s
+        ORDER BY group_name
+        """,
+        (str(ACCOUNTS_GROUP_ID),),
+        fetchall=True,
+    )
+
+
+def get_all_expenses():
+    return db_execute(
+        """
+        SELECT group_id, group_name, total
+        FROM group_expenses
+        WHERE group_id != %s
+        ORDER BY group_name
+        """,
+        (str(ACCOUNTS_GROUP_ID),),
+        fetchall=True,
+    )
+
+
+# ============================================================
+# LEDGER HELPERS
+# ============================================================
+
+
+def ledger_get(group_id, message_id):
+    return db_execute(
+        """
+        SELECT *
+        FROM transaction_ledger
+        WHERE group_id = %s
+          AND telegram_message_id = %s
+        ORDER BY id DESC
+        LIMIT 1
         """,
         (group_id, message_id),
         fetchone=True,
     )
 
 
-def insert_transaction(group_id, group_name, message_id, transaction_type, amount, description):
-    row = db_execute(
+def ledger_insert(
+    group_id,
+    group_name,
+    message_id,
+    transaction_type,
+    amount,
+    description,
+):
+    # Explicit existence check means we do not depend on a UNIQUE
+    # constraint in an already-existing Supabase table.
+    if ledger_get(group_id, message_id):
+        return None
+
+    return db_execute(
         """
-        INSERT INTO transactions (
-            group_id, group_name, telegram_message_id,
-            transaction_type, amount, description, month_key
+        INSERT INTO transaction_ledger (
+            group_id,
+            group_name,
+            telegram_message_id,
+            transaction_type,
+            amount,
+            description,
+            month_key
         )
         VALUES (%s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (group_id, telegram_message_id) DO NOTHING
         RETURNING id
         """,
         (
             group_id,
             group_name,
-            message_id,
+            int(message_id),
             transaction_type,
             int(amount),
             description,
             current_month_key(),
         ),
         fetchone=True,
-    )
-    return row["id"] if row else None
+    )["id"]
 
 
-def update_transaction(transaction_id, transaction_type, amount, description, group_name):
-    return db_execute(
+def ledger_update(row_id, transaction_type, amount, description, group_name):
+    db_execute(
         """
-        UPDATE transactions
+        UPDATE transaction_ledger
         SET transaction_type = %s,
             amount = %s,
             description = %s,
             group_name = %s,
             updated_at = NOW()
         WHERE id = %s
-        RETURNING *
         """,
-        (transaction_type, int(amount), description, group_name, transaction_id),
-        fetchone=True,
+        (
+            transaction_type,
+            int(amount),
+            description,
+            group_name,
+            row_id,
+        ),
     )
 
 
-def deactivate_transaction(transaction_id):
+def ledger_remove_amount(group_id, amount):
+    row = db_execute(
+        """
+        SELECT *
+        FROM transaction_ledger
+        WHERE group_id = %s
+          AND month_key = %s
+          AND is_active = TRUE
+          AND transaction_type = 'expense'
+          AND amount = %s
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (group_id, current_month_key(), int(amount)),
+        fetchone=True,
+    )
+
+    if not row:
+        return None
+
     db_execute(
         """
-        UPDATE transactions
-        SET is_active = FALSE, updated_at = NOW()
+        UPDATE transaction_ledger
+        SET is_active = FALSE,
+            updated_at = NOW()
         WHERE id = %s
         """,
-        (transaction_id,),
+        (row["id"],),
     )
 
-
-def get_group_current_total(group_id, month=None):
-    month = month or current_month_key()
-    row = db_execute(
-        """
-        SELECT COALESCE(SUM(amount), 0) AS total
-        FROM transactions
-        WHERE group_id = %s
-          AND month_key = %s
-          AND is_active = TRUE
-          AND transaction_type IN ('income', 'refund', 'opening')
-        """,
-        (group_id, month),
-        fetchone=True,
-    )
-    return int(row["total"])
+    return row
 
 
-def get_group_previous_income(group_id, transaction_id):
-    row = db_execute(
-        """
-        SELECT COALESCE(SUM(amount), 0) AS total
-        FROM transactions
-        WHERE group_id = %s
-          AND month_key = %s
-          AND is_active = TRUE
-          AND transaction_type IN ('income', 'refund', 'opening')
-          AND id != %s
-        """,
-        (group_id, current_month_key(), transaction_id),
-        fetchone=True,
-    )
-    return int(row["total"])
-
-
-def get_group_current_expense(group_id, month=None):
-    month = month or current_month_key()
-    row = db_execute(
-        """
-        SELECT COALESCE(SUM(amount), 0) AS total
-        FROM transactions
-        WHERE group_id = %s
-          AND month_key = %s
-          AND is_active = TRUE
-          AND transaction_type = 'expense'
-        """,
-        (group_id, month),
-        fetchone=True,
-    )
-    return int(row["total"])
-
-
-def get_group_previous_expense(group_id, transaction_id):
-    row = db_execute(
-        """
-        SELECT COALESCE(SUM(amount), 0) AS total
-        FROM transactions
-        WHERE group_id = %s
-          AND month_key = %s
-          AND is_active = TRUE
-          AND transaction_type = 'expense'
-          AND id != %s
-        """,
-        (group_id, current_month_key(), transaction_id),
-        fetchone=True,
-    )
-    return int(row["total"])
-
-
-def get_income_groups(month=None):
-    month = month or current_month_key()
+def ledger_month_rows(month):
     return db_execute(
         """
-        SELECT group_id, MAX(group_name) AS group_name,
-               COALESCE(SUM(amount), 0) AS total
-        FROM transactions
+        SELECT
+            group_id,
+            MAX(group_name) AS group_name,
+            COALESCE(
+                SUM(amount) FILTER (
+                    WHERE transaction_type IN ('income', 'refund')
+                ), 0
+            ) AS income,
+            COALESCE(
+                SUM(amount) FILTER (
+                    WHERE transaction_type = 'expense'
+                ), 0
+            ) AS expense
+        FROM transaction_ledger
         WHERE month_key = %s
           AND is_active = TRUE
-          AND transaction_type IN ('income', 'refund', 'opening')
-          AND group_id != %s
-          AND NOT EXISTS (
-              SELECT 1 FROM expense_group_config egc
-              WHERE egc.id = 1 AND egc.group_id = transactions.group_id
-          )
-          AND LOWER(group_name) != LOWER(%s)
-        GROUP BY group_id
-        ORDER BY group_name
-        """,
-        (month, str(ACCOUNTS_GROUP_ID), EXPENSES_GROUP_NAME),
-        fetchall=True,
-    )
-
-
-def get_expense_groups(month=None):
-    month = month or current_month_key()
-    return db_execute(
-        """
-        SELECT group_id, MAX(group_name) AS group_name,
-               COALESCE(SUM(amount), 0) AS total
-        FROM transactions
-        WHERE month_key = %s
-          AND is_active = TRUE
-          AND transaction_type = 'expense'
           AND group_id != %s
         GROUP BY group_id
         ORDER BY group_name
@@ -453,124 +487,62 @@ def get_expense_groups(month=None):
     )
 
 
-def get_totals(month=None):
-    income_groups = get_income_groups(month)
-    expense_groups = get_expense_groups(month)
-    total_income = sum(int(row["total"]) for row in income_groups)
-    total_expenses = sum(int(row["total"]) for row in expense_groups)
-    return income_groups, expense_groups, total_income, total_expenses
-
 # ============================================================
-# LEGACY DATABASE MIGRATION
+# ACCOUNTS DISPLAY
 # ============================================================
 
 
-def migrate_legacy_totals_once():
-    """
-    If the current Supabase database was created by the older bot, preserve
-    its current totals as opening balances. From that point onward every new
-    Telegram message is stored individually in transactions.
+def build_accounts_message(action_line):
+    groups = get_all_groups()
+    expenses = get_all_expenses()
 
-    Opening balances have no real Telegram message, so they use negative
-    synthetic message IDs and cannot be edited/removed by Telegram message ID.
-    """
-    marker = db_execute(
-        """
-        SELECT 1 FROM transactions
-        WHERE transaction_type = 'opening'
-        LIMIT 1
-        """,
-        fetchone=True,
-    )
-    if marker:
-        return
-
-    legacy_income = db_execute(
-        "SELECT group_id, group_name, total FROM group_totals WHERE total <> 0",
-        fetchall=True,
-    )
-    legacy_expenses = db_execute(
-        "SELECT group_id, group_name, total FROM group_expenses WHERE total <> 0",
-        fetchall=True,
-    )
-
-    synthetic_id = -1000000000000
-    for row in legacy_income:
-        exists = get_transaction(str(row["group_id"]), synthetic_id)
-        if not exists:
-            db_execute(
-                """
-                INSERT INTO transactions (
-                    group_id, group_name, telegram_message_id,
-                    transaction_type, amount, description, month_key
-                ) VALUES (%s, %s, %s, 'opening', %s, 'Legacy opening balance', %s)
-                ON CONFLICT (group_id, telegram_message_id) DO NOTHING
-                """,
-                (
-                    str(row["group_id"]),
-                    row["group_name"] or "Unknown Group",
-                    synthetic_id,
-                    int(row["total"]),
-                    current_month_key(),
-                ),
-            )
-        synthetic_id -= 1
-
-    for row in legacy_expenses:
-        exists = get_transaction(str(row["group_id"]), synthetic_id)
-        if not exists:
-            db_execute(
-                """
-                INSERT INTO transactions (
-                    group_id, group_name, telegram_message_id,
-                    transaction_type, amount, description, month_key
-                ) VALUES (%s, %s, %s, 'expense', %s, 'Legacy expense opening balance', %s)
-                ON CONFLICT (group_id, telegram_message_id) DO NOTHING
-                """,
-                (
-                    str(row["group_id"]),
-                    row["group_name"] or "Unknown Group",
-                    synthetic_id,
-                    int(row["total"]),
-                    current_month_key(),
-                ),
-            )
-        synthetic_id -= 1
-
-    conn.commit()
-
-
-migrate_legacy_totals_once()
-
-# ============================================================
-# ACCOUNTS MESSAGE
-# ============================================================
-
-
-def build_accounts_message(action_line, month=None):
-    income_groups, expense_groups, total_income, total_expenses = get_totals(month)
+    total_income = sum(int(row["total"]) for row in groups)
+    total_expenses = sum(int(row["total"]) for row in expenses)
 
     lines = [action_line, "", "Cars Income:"]
-    for row in income_groups:
+
+    for row in groups:
         lines.append(f'{row["group_name"]} : {int(row["total"])}')
 
-    # Expenses are intentionally shown as a total section only, matching
-    # the requested Accounts layout.
     lines.extend([
         "",
         f"Total Income: {total_income}",
         f"Total Expenses: {total_expenses}",
         f"Net Total : {total_income - total_expenses}",
     ])
+
     return "\n".join(lines)
+
+
+# ============================================================
+# ADMIN
+# ============================================================
+
+
+async def is_admin(update, context):
+    if not update.effective_chat or not update.effective_user:
+        return False
+
+    admins = await context.bot.get_chat_administrators(
+        update.effective_chat.id
+    )
+    return update.effective_user.id in {
+        admin.user.id for admin in admins
+    }
+
 
 # ============================================================
 # MESSAGE PROCESSING
 # ============================================================
 
 
-async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, is_edited=False):
+async def process_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    is_edited=False,
+):
     msg = update.edited_message if is_edited else update.message
+
     if not msg or not msg.text or not update.effective_chat:
         return
 
@@ -581,21 +553,32 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, is
     if update.effective_chat.id == ACCOUNTS_GROUP_ID:
         return
 
-    expense_group = is_configured_expenses_group(source_group_id, source_group_name)
+    expense_group = is_configured_expenses_group(
+        source_group_id,
+        source_group_name,
+    )
+
     price = extract_price(msg.text)
     refund = extract_refund(msg.text)
     expense = extract_expense(msg.text) if expense_group else None
 
-    # Expense messages cannot also contain Price/Refund.
+    # ========================================================
+    # DETERMINE TRANSACTION
+    # ========================================================
+
     if expense_group:
+        # Expenses must not also look like income/refund.
         if expense is None or price is not None or refund is not None:
             return
+
         transaction_type = "expense"
         amount = expense
         description = extract_expense_name(msg.text)
+
     else:
         if price is not None and refund is not None:
             return
+
         if price is not None:
             transaction_type = "income"
             amount = price
@@ -607,11 +590,12 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, is
         else:
             return
 
-    # --------------------------------------------------------
+    # ========================================================
     # NEW MESSAGE
-    # --------------------------------------------------------
+    # ========================================================
+
     if not is_edited:
-        transaction_id = insert_transaction(
+        ledger_id = ledger_insert(
             source_group_id,
             source_group_name,
             message_id,
@@ -620,68 +604,115 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, is
             description,
         )
 
-        # Telegram may redeliver the same message/update. The unique key
-        # means it is counted only once.
-        if transaction_id is None:
+        # Same Telegram message already processed.
+        if ledger_id is None:
             return
 
         if transaction_type == "income":
-            previous = get_group_previous_income(source_group_id, transaction_id)
-            action_line = f"{source_group_name} {previous} + {amount} = {previous + amount}"
-        elif transaction_type == "refund":
-            previous = get_group_previous_income(source_group_id, transaction_id)
-            action_line = f"{source_group_name} {previous} + Refund: {amount} = {previous + amount}"
-        else:
-            previous = get_group_previous_expense(source_group_id, transaction_id)
-            action_line = (
-                "Cars Expenses\n"
-                f"{description} : {previous} + {amount} = {previous + amount}"
+            old_total = get_existing_total(source_group_id)
+            new_total = old_total + amount
+            save_total(
+                source_group_id,
+                source_group_name,
+                new_total,
             )
 
-    # --------------------------------------------------------
+            action_line = (
+                f"{source_group_name} "
+                f"{old_total} + {amount} = {new_total}"
+            )
+
+        elif transaction_type == "refund":
+            old_total = get_existing_total(source_group_id)
+            new_total = old_total + amount
+            save_total(
+                source_group_id,
+                source_group_name,
+                new_total,
+            )
+
+            action_line = (
+                f"{source_group_name} "
+                f"{old_total} + Refund: {amount} = {new_total}"
+            )
+
+        else:
+            old_expense = get_existing_expense(source_group_id)
+            new_expense = old_expense + amount
+            save_expense(
+                source_group_id,
+                source_group_name,
+                new_expense,
+            )
+
+            action_line = (
+                f"Cars Expenses\n"
+                f"{description} : "
+                f"{old_expense} + {amount} = {new_expense}"
+            )
+
+        await context.bot.send_message(
+            chat_id=ACCOUNTS_GROUP_ID,
+            text=build_accounts_message(action_line),
+        )
+        return
+
+    # ========================================================
     # EDITED MESSAGE
-    # --------------------------------------------------------
-    else:
-        existing = get_transaction(source_group_id, message_id)
-        if not existing:
-            # The bot only edits transactions it originally recorded.
-            return
+    # ========================================================
 
-        if existing["month_key"] != current_month_key():
-            return
+    existing = ledger_get(source_group_id, message_id)
 
-        old_amount = int(existing["amount"])
-        old_type = existing["transaction_type"]
+    # The new bot only recalculates edits for messages it recorded.
+    if not existing:
+        return
 
-        update_transaction(
-            existing["id"],
-            transaction_type,
-            amount,
-            description,
+    # Do not allow an old month's edit to alter the current month.
+    if existing["month_key"] != current_month_key():
+        return
+
+    old_amount = int(existing["amount"])
+    adjustment = int(amount) - old_amount
+
+    ledger_update(
+        existing["id"],
+        transaction_type,
+        amount,
+        description,
+        source_group_name,
+    )
+
+    if transaction_type in ("income", "refund"):
+        old_total = get_existing_total(source_group_id)
+        new_total = old_total + adjustment
+
+        save_total(
+            source_group_id,
             source_group_name,
+            new_total,
         )
 
-        adjustment = amount - old_amount
+        action_line = (
+            f"{source_group_name} "
+            f"{old_total} + Edit: {adjustment:+d} = {new_total}"
+        )
 
-        if transaction_type == "income":
-            new_group_total = get_group_current_total(source_group_id)
-            previous = new_group_total - amount
-            action_line = (
-                f"{source_group_name} {previous} + Edit: {adjustment:+d} = {new_group_total}"
-            )
-        elif transaction_type == "refund":
-            new_group_total = get_group_current_total(source_group_id)
-            previous = new_group_total - amount
-            action_line = (
-                f"{source_group_name} {previous} + Refund: {adjustment:+d} = {new_group_total}"
-            )
-        else:
-            new_expense_total = get_group_current_expense(source_group_id)
-            previous = new_expense_total - amount
-            action_line = (
-                "Cars Expenses\n"
-                f"{description} : {previous} + Edit: {adjustment:+d} = {new_expense_total}"
-            )
+    else:
+        old_expense_total = get_existing_expense(source_group_id)
+        new_expense_total = old_expense_total + adjustment
+
+        save_expense(
+            source_group_id,
+            source_group_name,
+            new_expense_total,
+        )
+
+        action_line = (
+            f"Cars Expenses\n"
+            f"{description} : "
+            f"{old_expense_total} + Edit: {adjustment:+d} "
+            f"= {new_expense_total}"
+        )
 
     await context.bot.send_message(
         chat_id=ACCOUNTS_GROUP_ID,
@@ -689,23 +720,13 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, is
     )
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message(update, context):
     await process_message(update, context, is_edited=False)
 
 
-async def handle_edited_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_edited_message(update, context):
     await process_message(update, context, is_edited=True)
 
-# ============================================================
-# ADMIN CHECK
-# ============================================================
-
-
-async def is_admin(update, context):
-    if not update.effective_chat or not update.effective_user:
-        return False
-    admins = await context.bot.get_chat_administrators(update.effective_chat.id)
-    return update.effective_user.id in {admin.user.id for admin in admins}
 
 # ============================================================
 # /TOTAL
@@ -717,32 +738,47 @@ async def total_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if update.effective_chat.id == ACCOUNTS_GROUP_ID:
-        income_groups, expense_groups, total_income, total_expenses = get_totals()
-        if not income_groups and not expense_groups:
-            await update.message.reply_text("No group totals recorded yet.")
+        groups = get_all_groups()
+        expenses = get_all_expenses()
+
+        if not groups and not expenses:
+            await update.message.reply_text(
+                "No group totals recorded yet."
+            )
             return
 
+        total_income = sum(int(row["total"]) for row in groups)
+        total_expenses = sum(int(row["total"]) for row in expenses)
+
         lines = ["Cars Income:"]
-        for row in income_groups:
-            lines.append(f'{row["group_name"]} : {int(row["total"])}')
+
+        for row in groups:
+            lines.append(
+                f'{row["group_name"]} : {int(row["total"])}'
+            )
+
         lines.extend([
             "",
             f"Total Income: {total_income}",
             f"Total Expenses: {total_expenses}",
             f"Net Total : {total_income - total_expenses}",
         ])
+
         await update.message.reply_text("\n".join(lines))
         return
 
     group_id = str(update.effective_chat.id)
     group_name = update.effective_chat.title or "This group"
-    total = get_group_current_total(group_id)
-    expenses = get_group_current_expense(group_id)
+
+    income = get_existing_total(group_id)
+    expenses = get_existing_expense(group_id)
+
     await update.message.reply_text(
-        f"{group_name} total: {total}\n"
+        f"{group_name} total: {income}\n"
         f"{group_name} expenses: {expenses}\n"
-        f"Net total: {total - expenses}"
+        f"Net total: {income - expenses}"
     )
+
 
 # ============================================================
 # /HELP
@@ -753,64 +789,72 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Here's what I can do:\n\n"
         "Income:\n"
-        "Price: 200 — add 200 to this group's income\n"
-        "Refund: 50 — deduct 50 from this group's income\n\n"
+        "Price: 200\n"
+        "Refund: 50\n\n"
         "Expenses:\n"
-        "Car wash myvi black\n"
-        "6964\n"
-        "Rm 10\n\n"
-        "Or use:\n"
+        "RM 15 / RM50 / 50 RM\n"
+        "or:\n"
         "Car name: GENERAL\n"
         "Amount: 50\n"
         "Paid to: GOOGLE\n"
         "Details: GOOGLE ADS\n\n"
         "Commands:\n"
-        "/help — show this command list\n"
         "/total — show current totals\n"
-        "/recalculate — recalculate this month\n"
+        "/recalculate — recalculate the current month\n"
         "/recalculate YYYY-MM — recalculate a specific month\n"
-        "/reset — reset this group's current month totals (admins only)\n"
-        "/resetall — reset all current month totals (Accounts admins only)\n"
-        "/setexpenses — register this group as Car Expenses (admin only)\n"
-        "/remove MESSAGE_ID — remove one wrongly recorded transaction (admin only)\n\n"
-        "Edited Price, Refund and Expense messages are automatically recalculated.\n"
-        "Deleted messages are left unchanged."
+        "/remove AMOUNT — remove the most recent matching expense\n"
+        "/reset — reset this group's current totals (admin)\n"
+        "/setexpenses — register this group as Cars Expenses (admin)\n"
+        "/resetall — reset all current totals (Accounts admin)\n"
+        "/help — show these commands\n\n"
+        "Edited Price, Refund, and Expense messages are automatically "
+        "recalculated.\n"
+        "Deleted messages are not processed."
     )
+
 
 # ============================================================
 # /RESET
 # ============================================================
 
 
-async def deactivate_group_current_month(group_id):
-    db_execute(
-        """
-        UPDATE transactions
-        SET is_active = FALSE, updated_at = NOW()
-        WHERE group_id = %s AND month_key = %s AND is_active = TRUE
-        """,
-        (group_id, current_month_key()),
-    )
-
-
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_chat or not update.message:
         return
+
     if not await is_admin(update, context):
-        await update.message.reply_text("Only group admins can reset the total.")
+        await update.message.reply_text(
+            "Only group admins can reset the total."
+        )
         return
 
     chat_id = str(update.effective_chat.id)
     group_name = update.effective_chat.title or "This group"
-    old_income = get_group_current_total(chat_id)
-    old_expense = get_group_current_expense(chat_id)
-    await deactivate_group_current_month(chat_id)
+
+    old_income = get_existing_total(chat_id)
+    old_expense = get_existing_expense(chat_id)
+
+    save_total(chat_id, group_name, 0)
+    save_expense(chat_id, group_name, 0)
+
+    # Close active ledger entries for the current month.
+    db_execute(
+        """
+        UPDATE transaction_ledger
+        SET is_active = FALSE, updated_at = NOW()
+        WHERE group_id = %s
+          AND month_key = %s
+          AND is_active = TRUE
+        """,
+        (chat_id, current_month_key()),
+    )
 
     await update.message.reply_text(
         f"{group_name} reset:\n"
         f"Income: {old_income} → 0\n"
         f"Expenses: {old_expense} → 0"
     )
+
     await context.bot.send_message(
         chat_id=ACCOUNTS_GROUP_ID,
         text=(
@@ -820,192 +864,244 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ),
     )
 
+
 # ============================================================
 # /SETEXPENSES
 # ============================================================
 
 
-async def setexpenses_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def setexpenses_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     if not update.effective_chat or not update.message:
         return
+
     if update.effective_chat.id == ACCOUNTS_GROUP_ID:
-        await update.message.reply_text("Use /setexpenses inside the Cars Expenses group.")
+        await update.message.reply_text(
+            "Use /setexpenses inside the Cars Expenses group."
+        )
         return
+
     if not await is_admin(update, context):
-        await update.message.reply_text("Only group admins can set the expenses group.")
+        await update.message.reply_text(
+            "Only group admins can set the expenses group."
+        )
         return
 
     chat_id = str(update.effective_chat.id)
     group_name = update.effective_chat.title or "Cars Expenses"
+
     db_execute(
         """
         INSERT INTO expense_group_config (id, group_id, group_name)
         VALUES (1, %s, %s)
-        ON CONFLICT (id) DO UPDATE SET
+        ON CONFLICT(id)
+        DO UPDATE SET
             group_id = EXCLUDED.group_id,
             group_name = EXCLUDED.group_name
         """,
         (chat_id, group_name),
     )
-    await update.message.reply_text(f"{group_name} is now registered as the expenses group.")
+
+    await update.message.reply_text(
+        f"{group_name} is now registered as the expenses group."
+    )
+
 
 # ============================================================
-# /REMOVE
+# /REMOVE AMOUNT
 # ============================================================
 
 
 async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_chat or not update.message:
         return
-    if not await is_admin(update, context):
-        await update.message.reply_text("Only group admins can use /remove.")
-        return
 
-    chat_id = str(update.effective_chat.id)
-    group_name = update.effective_chat.title or "This group"
-
-    # Preferred use: /remove 4533
-    if context.args:
-        if len(context.args) != 1 or not re.fullmatch(r"\d+", context.args[0]):
-            await update.message.reply_text("Use /remove MESSAGE_ID\nExample: /remove 4533")
-            return
-
-        message_id = int(context.args[0])
-        transaction = get_transaction(chat_id, message_id)
-
-        if not transaction:
-            await update.message.reply_text(
-                f"I couldn't find a recorded transaction with message ID {message_id}."
-            )
-            return
-
-        if transaction["transaction_type"] == "opening":
-            await update.message.reply_text("That is an opening balance and cannot be removed by message ID.")
-            return
-
-        if not transaction["is_active"]:
-            await update.message.reply_text("That transaction has already been removed.")
-            return
-
-        old_amount = int(transaction["amount"])
-        deactivate_transaction(transaction["id"])
-
+    if update.effective_chat.id == ACCOUNTS_GROUP_ID:
         await update.message.reply_text(
-            f"Removed message {message_id}: {transaction['description'] or 'Transaction'} ({old_amount})."
-        )
-
-        await context.bot.send_message(
-            chat_id=ACCOUNTS_GROUP_ID,
-            text=build_accounts_message(
-                f"Removed: {group_name} {old_amount} from message {message_id}"
-            ),
+            "Use /remove inside the Cars Expenses group."
         )
         return
 
-    # Backward-compatible behavior: /remove with no ID removes the current
-    # group's current-month transactions, as the older bot did.
-    old_income = get_group_current_total(chat_id)
-    old_expense = get_group_current_expense(chat_id)
-    await deactivate_group_current_month(chat_id)
+    if not await is_admin(update, context):
+        await update.message.reply_text(
+            "Only group admins can remove expenses."
+        )
+        return
+
+    if (
+        not context.args
+        or not re.fullmatch(r"\d+(?:\.\d+)?", context.args[0])
+    ):
+        await update.message.reply_text(
+            "Use /remove AMOUNT\n"
+            "Example: /remove 50"
+        )
+        return
+
+    amount = int(float(context.args[0]))
+    chat_id = str(update.effective_chat.id)
+    group_name = update.effective_chat.title or "Cars Expenses"
+
+    row = ledger_remove_amount(chat_id, amount)
+
+    if not row:
+        await update.message.reply_text(
+            f"No active RM{amount} expense was found for this month."
+        )
+        return
+
+    old_expense = get_existing_expense(chat_id)
+    new_expense = max(0, old_expense - amount)
+
+    save_expense(chat_id, group_name, new_expense)
 
     await update.message.reply_text(
-        f"{group_name} current month tracking removed:\n"
-        f"Income: {old_income}\n"
-        f"Expenses: {old_expense}"
+        f"Removed RM{amount} expense:\n"
+        f"{row.get('description') or 'Expense'}"
     )
+
+    action_line = (
+        f"Cars Expenses\n"
+        f"Removed: {row.get('description') or 'Expense'} "
+        f"- {amount}"
+    )
+
     await context.bot.send_message(
         chat_id=ACCOUNTS_GROUP_ID,
-        text=f"{group_name} was removed from current month tracking by an admin."
+        text=build_accounts_message(action_line),
     )
+
 
 # ============================================================
 # /RESETALL
 # ============================================================
 
 
-async def deactivate_all_current_transactions():
+async def resetall_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not update.effective_chat or not update.message:
+        return
+
+    if update.effective_chat.id != ACCOUNTS_GROUP_ID:
+        await update.message.reply_text(
+            "This command can only be used in the Accounts group."
+        )
+        return
+
+    if not await is_admin(update, context):
+        await update.message.reply_text(
+            "Only group admins can reset all totals."
+        )
+        return
+
+    groups = get_all_groups()
+    expenses = get_all_expenses()
+
+    if not groups and not expenses:
+        await update.message.reply_text("No groups to reset.")
+        return
+
+    lines = ["All groups manually reset:"]
+
+    for row in groups:
+        lines.append(
+            f'{row["group_name"]} : {int(row["total"])} → 0'
+        )
+
+    for row in expenses:
+        lines.append(
+            f'{row["group_name"]} expenses : '
+            f'{int(row["total"])} → 0'
+        )
+
+    db_execute("UPDATE group_totals SET total = 0")
+    db_execute("UPDATE group_expenses SET total = 0")
+
     db_execute(
         """
-        UPDATE transactions
+        UPDATE transaction_ledger
         SET is_active = FALSE, updated_at = NOW()
         WHERE month_key = %s AND is_active = TRUE
         """,
         (current_month_key(),),
     )
 
-
-async def resetall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_chat or not update.message:
-        return
-    if update.effective_chat.id != ACCOUNTS_GROUP_ID:
-        await update.message.reply_text("This command can only be used in the Accounts group.")
-        return
-    if not await is_admin(update, context):
-        await update.message.reply_text("Only group admins can reset all totals.")
-        return
-
-    income_groups, expense_groups, _, _ = get_totals()
-    if not income_groups and not expense_groups:
-        await update.message.reply_text("No groups to reset.")
-        return
-
-    lines = ["All groups manually reset:"]
-    for row in income_groups:
-        lines.append(f'{row["group_name"]} : {int(row["total"])} → 0')
-    for row in expense_groups:
-        lines.append(f'{row["group_name"]} expenses : {int(row["total"])} → 0')
-
-    await deactivate_all_current_transactions()
     lines.append("\nAll totals are now 0.")
     await update.message.reply_text("\n".join(lines))
+
 
 # ============================================================
 # /RECALCULATE
 # ============================================================
 
 
-def calculate_month(month):
-    income_rows = get_income_groups(month)
-    expense_rows = get_expense_groups(month)
-    total_income = sum(int(row["total"]) for row in income_rows)
-    total_expenses = sum(int(row["total"]) for row in expense_rows)
-    return income_rows, expense_rows, total_income, total_expenses
-
-
-async def recalculate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def recalculate_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     if not update.effective_chat or not update.message:
         return
+
     if update.effective_chat.id != ACCOUNTS_GROUP_ID:
-        await update.message.reply_text("This command can only be used in the Accounts group.")
+        await update.message.reply_text(
+            "This command can only be used in the Accounts group."
+        )
         return
+
     if not await is_admin(update, context):
-        await update.message.reply_text("Only group admins can recalculate totals.")
+        await update.message.reply_text(
+            "Only group admins can recalculate totals."
+        )
         return
 
     requested_month = current_month_key()
+
     if context.args:
-        value = context.args[0].strip()
-        if not re.fullmatch(r"\d{4}-\d{2}", value):
+        requested_month = context.args[0].strip()
+
+        if not month_is_valid(requested_month):
             await update.message.reply_text(
                 "Use /recalculate or /recalculate YYYY-MM\n"
-                "Example: /recalculate 2026-08"
+                "Example: /recalculate 2026-09"
             )
             return
-        requested_month = value
 
-    income_rows, expense_rows, total_income, total_expenses = calculate_month(requested_month)
+    rows = ledger_month_rows(requested_month)
 
-    lines = [f"Recalculated: {requested_month}", "", "Cars Income:"]
-    for row in income_rows:
-        lines.append(f'{row["group_name"]} : {int(row["total"])}')
+    total_income = sum(int(row["income"]) for row in rows)
+    total_expenses = sum(int(row["expense"]) for row in rows)
+
+    lines = [
+        f"Recalculated: {requested_month}",
+        "",
+        "Cars Income:",
+    ]
+
+    for row in rows:
+        income = int(row["income"])
+        if income:
+            lines.append(
+                f'{row["group_name"]} : {income}'
+            )
 
     lines.extend([
         "",
-        "Cars Expenses:",
+        "Cars Expenses",
     ])
+
+    expense_rows = [
+        row for row in rows if int(row["expense"])
+    ]
+
     if expense_rows:
         for row in expense_rows:
-            lines.append(f'{row["group_name"]} : {int(row["total"])}')
+            lines.append(
+                f'{row["group_name"]} : {int(row["expense"])}'
+            )
     else:
         lines.append("None")
 
@@ -1018,6 +1114,7 @@ async def recalculate_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await update.message.reply_text("\n".join(lines))
 
+
 # ============================================================
 # MONTHLY RESET
 # ============================================================
@@ -1025,7 +1122,12 @@ async def recalculate_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 def has_reset_this_month():
     row = db_execute(
-        "SELECT id FROM reset_log WHERE reset_month = %s",
+        """
+        SELECT id
+        FROM reset_log
+        WHERE reset_month = %s
+        LIMIT 1
+        """,
         (current_month_key(),),
         fetchone=True,
     )
@@ -1033,11 +1135,26 @@ def has_reset_this_month():
 
 
 def mark_reset_this_month():
+    if not has_reset_this_month():
+        db_execute(
+            """
+            INSERT INTO reset_log (reset_month)
+            VALUES (%s)
+            """,
+            (current_month_key(),),
+        )
+
+
+def reset_current_month_totals():
+    db_execute("UPDATE group_totals SET total = 0")
+    db_execute("UPDATE group_expenses SET total = 0")
+
     db_execute(
         """
-        INSERT INTO reset_log (reset_month)
-        VALUES (%s)
-        ON CONFLICT (reset_month) DO NOTHING
+        UPDATE transaction_ledger
+        SET is_active = FALSE, updated_at = NOW()
+        WHERE month_key = %s
+          AND is_active = TRUE
         """,
         (current_month_key(),),
     )
@@ -1047,32 +1164,50 @@ async def monthly_reset(context: ContextTypes.DEFAULT_TYPE):
     if has_reset_this_month():
         return
 
-    income_groups, expense_groups, _, _ = get_totals()
+    groups = get_all_groups()
+    expenses = get_all_expenses()
+
+    # Mark the month first so a duplicate job cannot reset it twice.
     mark_reset_this_month()
 
-    if not income_groups and not expense_groups:
+    if not groups and not expenses:
         return
 
     lines = [f"Monthly reset — {current_month_label()}"]
-    for row in income_groups:
-        lines.append(f'{row["group_name"]} : {int(row["total"])} → 0')
-    for row in expense_groups:
-        lines.append(f'{row["group_name"]} expenses : {int(row["total"])} → 0')
 
-    await deactivate_all_current_transactions()
-    await context.bot.send_message(chat_id=ACCOUNTS_GROUP_ID, text="\n".join(lines))
-    print(f"Monthly reset done for {current_month_label()}")
+    for row in groups:
+        lines.append(
+            f'{row["group_name"]} : {int(row["total"])} → 0'
+        )
+
+    for row in expenses:
+        lines.append(
+            f'{row["group_name"]} expenses : '
+            f'{int(row["total"])} → 0'
+        )
+
+    reset_current_month_totals()
+
+    await context.bot.send_message(
+        chat_id=ACCOUNTS_GROUP_ID,
+        text="\n".join(lines),
+    )
 
 
 async def startup_check(context: ContextTypes.DEFAULT_TYPE):
+    # If Render restarts after midnight on the 1st, catch the missed reset.
     if has_reset_this_month():
         return
 
-    income_groups, expense_groups, _, _ = get_totals()
-    if income_groups or expense_groups:
+    groups = get_all_groups()
+    expenses = get_all_expenses()
+
+    if groups or expenses:
         await monthly_reset(context)
     else:
+        # September 2026 and other genuinely empty months start clean.
         mark_reset_this_month()
+
 
 # ============================================================
 # RENDER HEALTH CHECK
@@ -1091,14 +1226,14 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 
 
 def run_health_server():
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
     server.serve_forever()
+
 
 # ============================================================
 # BOT STARTUP
 # ============================================================
-
 
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -1110,11 +1245,12 @@ app.add_handler(CommandHandler("resetall", resetall_command))
 app.add_handler(CommandHandler("remove", remove_command))
 app.add_handler(CommandHandler("recalculate", recalculate_command))
 
-# Normal messages only. Explicitly exclude edited messages so an edit is not
-# processed once as a new message and again as an edit.
+# Normal messages only.
 app.add_handler(
     MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.UpdateType.MESSAGE,
+        filters.TEXT
+        & ~filters.COMMAND
+        & filters.UpdateType.MESSAGE,
         handle_message,
     )
 )
@@ -1122,20 +1258,26 @@ app.add_handler(
 # Edited messages only.
 app.add_handler(
     MessageHandler(
-        filters.TEXT & filters.UpdateType.EDITED_MESSAGE,
+        filters.TEXT
+        & filters.UpdateType.EDITED_MESSAGE,
         handle_edited_message,
     )
 )
 
-# Catch a restart that happens after midnight on the first day of a month.
+# Catch a Render restart that happens after midnight on the 1st.
 app.job_queue.run_once(startup_check, when=5)
+
+# Automatic monthly reset at 00:00 Kuala Lumpur time on day 1.
 app.job_queue.run_monthly(
     monthly_reset,
     when=time(0, 0, 0, tzinfo=KL_TZ),
     day=1,
 )
 
-threading.Thread(target=run_health_server, daemon=True).start()
+threading.Thread(
+    target=run_health_server,
+    daemon=True,
+).start()
 
 print("Carentza Cars Bot is running...")
 app.run_polling()
